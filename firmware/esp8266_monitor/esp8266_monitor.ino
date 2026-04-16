@@ -10,13 +10,14 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
-const char* WIFI_SSID = "SEU_WIFI";
-const char* WIFI_PASSWORD = "SUA_SENHA";
-const char* API_URL = "http://192.168.1.10:8000/metrics";
+const char* WIFI_SSID = "ssid";
+const char* WIFI_PASSWORD = "password";
+const char* API_URL = "http://192.168.0.20:8000/metrics";
 
 const unsigned long FETCH_INTERVAL_MS = 10000;
 const unsigned long PAGE_INTERVAL_MS = 5000;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -109,26 +110,58 @@ void renderCurrentPage() {
 
 void startWifiConnection() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Conectando em '%s'...\n", WIFI_SSID);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.printf("Status Wi-Fi: %d\n", WiFi.status());
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wi-Fi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Falha ao conectar no Wi-Fi dentro do tempo limite.");
+    Serial.print("Ultimo status: ");
+    Serial.println(WiFi.status());
+  }
 }
 
 void fetchMetrics() {
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi desconectado, leitura ignorada.");
     return;
   }
 
   WiFiClient client;
   HTTPClient http;
+  http.setTimeout(5000);
 
   if (!http.begin(client, API_URL)) {
+    Serial.println("Falha ao iniciar HTTPClient.");
     return;
   }
 
   int httpCode = http.GET();
+  Serial.printf("HTTP GET %s -> %d\n", API_URL, httpCode);
 
   if (httpCode == HTTP_CODE_OK) {
-    DynamicJsonDocument doc(1536);
-    DeserializationError error = deserializeJson(doc, http.getString());
+    StaticJsonDocument<256> filter;
+    filter["cpu"]["percent"] = true;
+    filter["disk"]["free_gb"] = true;
+    filter["energy_estimate"]["instant_power_watts"] = true;
+    filter["containers"]["running"] = true;
+    filter["containers"]["inactive"] = true;
+
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(
+      doc,
+      http.getStream(),
+      DeserializationOption::Filter(filter)
+    );
 
     if (!error) {
       cpuPercent = doc["cpu"]["percent"] | 0.0f;
@@ -136,13 +169,26 @@ void fetchMetrics() {
       powerWatts = doc["energy_estimate"]["instant_power_watts"] | 0.0f;
       containersRunning = doc["containers"]["running"] | 0;
       containersInactive = doc["containers"]["inactive"] | 0;
+      Serial.printf(
+        "Dados atualizados: CPU=%.1f Disco=%.2f Running=%d Inactive=%d Energia=%.1f\n",
+        cpuPercent,
+        diskFreeGb,
+        containersRunning,
+        containersInactive,
+        powerWatts
+      );
+    } else {
+      Serial.printf("Erro ao desserializar JSON: %s\n", error.c_str());
     }
+  } else {
+    Serial.printf("Resposta HTTP inesperada: %d\n", httpCode);
   }
 
   http.end();
 }
 
 void setup() {
+  Serial.begin(115200);
   Wire.begin(D2, D1);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
